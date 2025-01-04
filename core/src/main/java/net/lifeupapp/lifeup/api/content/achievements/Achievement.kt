@@ -20,7 +20,7 @@ data class Achievement(
     val itemId: Long?,
     val itemAmount: Int?,
     val unlockedTime: Long?,
-    val items: List<RewardItem>?    
+    val items: List<RewardItem>?
 ) {
     class Builder {
         private var id: Long? = null
@@ -82,5 +82,12 @@ data class Achievement(
         fun builder(block: Builder.() -> Unit): Achievement {
             return Builder().apply(block).build()
         }
+
+        private const val TYPE_NORMAL = 0
+        private const val TYPE_SUBCATEGORY = 1
     }
+
+    fun isNormalAchievement() = type == TYPE_NORMAL
+
+    fun isSubcategory() = type == TYPE_SUBCATEGORY
 }

@@ -14,6 +14,12 @@ data class AchievementCategory(
     val order: Int,
     val type: Int
 ) {
+
+    enum class AchievementType(val type: Int) {
+        USER(0),
+        SYSTEM(1)
+    }
+
     class Builder {
         private var id: Long? = null
         private var name: String = ""

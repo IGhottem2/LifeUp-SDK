@@ -16,6 +16,17 @@ data class Skill(
     val currentLevelExp: Int,
     val type: Int
 ) {
+
+    enum class SkillType(val type: Int) {
+        USER(0),
+        DEFAULT_STRENGTH(1),
+        DEFAULT_LEARNING(2),
+        DEFAULT_CHARM(3),
+        DEFAULT_ENDURANCE(4),
+        DEFAULT_VITALITY(5),
+        DEFAULT_CREATIVE(6)
+    }
+
     class Builder {
         private var id: Long? = null
         private var name: String = ""
