@@ -18,53 +18,146 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up JDK 17
+      - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
-          java-version: '17'
+          java-version: '21'
           distribution: 'temurin'
           cache: gradle
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
+      - name: Prepare release keystore
+        run: |
+          test -n "${{ secrets.SIGNING_KEY }}"
+          test -n "${{ secrets.ALIAS }}"
+          test -n "${{ secrets.KEY_STORE_PASSWORD }}"
+          test -n "${{ secrets.KEY_PASSWORD }}"
+          echo "${{ secrets.SIGNING_KEY }}" | base64 --decode > "$RUNNER_TEMP/release-keystore.jks"
+
       - name: Build AAB
+        env:
+          SIGNING_STORE_FILE: ${{ runner.temp }}/release-keystore.jks
+          SIGNING_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: ./gradlew http:bundleRelease
 
-      - name: Sign AAB
-        id: sign
-        uses: r0adkll/sign-android-release@v1
-        with:
-          releaseDirectory: http/build/outputs/bundle/release
-          signingKeyBase64: ${{ secrets.SIGNING_KEY }}
-          alias: ${{ secrets.ALIAS }}
-          keyStorePassword: ${{ secrets.KEY_STORE_PASSWORD }}
-          keyPassword: ${{ secrets.KEY_PASSWORD }}
-        env:
-          BUILD_TOOLS_VERSION: "34.0.0"
+      - name: Verify 16 KB native alignment
+        run: bash scripts/check-16kb-alignment.sh
+
+      - name: Verify bundle certificate
+        run: |
+          keytool -printcert -jarfile http/build/outputs/bundle/release/http-release.aab | tee /tmp/release-bundle-cert.txt
+          if grep -q "Android Debug" /tmp/release-bundle-cert.txt; then
+            echo "Release bundle is still signed with the Android Debug key." >&2
+            exit 1
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-release
-          path: ${{steps.sign.outputs.signedReleaseFile}}
+          path: http/build/outputs/bundle/release/http-release.aab
+
+      - name: Upload to Play Store & download Play-signed APK
+        if: ${{ github.event.inputs.upload_play == 'true' || startsWith(github.ref, 'refs/tags/') }}
+        shell: bash
+        env:
+          SERVICE_ACCOUNT_JSON: ${{ secrets.SERVICE_ACCOUNT_JSON }}
+          PACKAGE_NAME: net.lifeupapp.lifeup.http
+        run: |
+          set -euo pipefail
+
+          # ---- version code (fail fast on parse errors) ----
+          VERSION_NAME=$(grep 'versionName' http/build.gradle | sed -n 's/.*"\(.*\)".*/\1/p')
+          if [ -z "$VERSION_NAME" ]; then
+            echo "Failed to extract versionName from http/build.gradle" >&2
+            exit 1
+          fi
+          IFS='.' read -r major minor patch <<< "$VERSION_NAME"
+          if [ -z "$major" ] || [ -z "$minor" ] || [ -z "$patch" ]; then
+            echo "Failed to parse versionName='$VERSION_NAME' (expected major.minor.patch)" >&2
+            exit 1
+          fi
+          VERSION_CODE=$((major * 10000 + minor * 100 + patch))
+          echo "versionName=$VERSION_NAME versionCode=$VERSION_CODE"
+
+          # ---- authenticate ----
+          CLIENT_EMAIL=$(echo "$SERVICE_ACCOUNT_JSON" | jq -r '.client_email')
+          PRIVATE_KEY=$(echo "$SERVICE_ACCOUNT_JSON" | jq -r '.private_key')
+
+          b64url() { base64 -w0 | tr '+/' '-_' | tr -d '='; }
+
+          KEY_FILE=$(mktemp)
+          trap 'rm -f "$KEY_FILE"' EXIT
+          printf '%s\n' "$PRIVATE_KEY" > "$KEY_FILE"
+
+          SCOPES="https://www.googleapis.com/auth/androidpublisher"
+          NOW=$(date +%s)
+          JWT_HEADER=$(echo -n '{"alg":"RS256","typ":"JWT"}' | b64url)
+          JWT_CLAIM=$(echo -n "{\"iss\":\"$CLIENT_EMAIL\",\"scope\":\"$SCOPES\",\"aud\":\"https://oauth2.googleapis.com/token\",\"exp\":$((NOW+3600)),\"iat\":$NOW}" | b64url)
+
+          JWT_SIG=$(echo -n "$JWT_HEADER.$JWT_CLAIM" | openssl dgst -sha256 -sign "$KEY_FILE" | b64url)
+
+          JWT="$JWT_HEADER.$JWT_CLAIM.$JWT_SIG"
+          ACCESS_TOKEN=$(curl -fsS -X POST "https://oauth2.googleapis.com/token" \
+            -d "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=$JWT" | jq -r '.access_token')
+          echo "Obtained access token"
+
+          # ---- start edit ----
+          EDIT_ID=$(curl -fsS -X POST "https://androidpublisher.googleapis.com/androidpublisher/v3/applications/$PACKAGE_NAME/edits" \
+            -H "Authorization: Bearer $ACCESS_TOKEN" | jq -r '.id')
+          echo "Edit ID: $EDIT_ID"
+
+          # ---- upload AAB ----
+          echo "Uploading AAB..."
+          UPLOAD_RESP=$(curl -fsS -X POST "https://androidpublisher.googleapis.com/upload/androidpublisher/v3/applications/$PACKAGE_NAME/edits/$EDIT_ID/bundles" \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary "@http/build/outputs/bundle/release/http-release.aab")
+          BUNDLE_VC=$(echo "$UPLOAD_RESP" | jq -r '.versionCode')
+          echo "Uploaded AAB, versionCode=$BUNDLE_VC"
+
+          # ---- assign to internal track (draft) ----
+          curl -fsS -X PUT "https://androidpublisher.googleapis.com/androidpublisher/v3/applications/$PACKAGE_NAME/edits/$EDIT_ID/tracks/internal" \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"releases\":[{\"name\":\"$VERSION_NAME\",\"versionCodes\":[$BUNDLE_VC],\"status\":\"draft\"}]}"
+          echo "Assigned to internal track"
+
+          # ---- commit edit ----
+          curl -fsS -X POST "https://androidpublisher.googleapis.com/androidpublisher/v3/applications/$PACKAGE_NAME/edits/$EDIT_ID:commit" \
+            -H "Authorization: Bearer $ACCESS_TOKEN"
+          echo "Edit committed, Play processing started"
+
+          # ---- Play-signed APK (short wait; fallback to local universal) ----
+          if VERSION_CODE="$BUNDLE_VC" OUT=app-release.apk MAX_TRIES=6 SLEEP_SECS=20 \
+               bash scripts/play-download-universal-apk.sh; then
+            echo "Downloaded Play-signed APK"
+          else
+            echo "Play-signed APK not available yet; building universal APK locally via bundletool"
+            BUNDLETOOL_VERSION="1.17.2"
+            BUNDLETOOL_JAR="/tmp/bundletool.jar"
+            curl -fSL -o "$BUNDLETOOL_JAR" "https://github.com/google/bundletool/releases/download/$BUNDLETOOL_VERSION/bundletool-all-$BUNDLETOOL_VERSION.jar"
+            java -jar "$BUNDLETOOL_JAR" build-apks \
+              --bundle=http/build/outputs/bundle/release/http-release.aab \
+              --output=/tmp/app-release.apks \
+              --mode=universal
+            unzip -o /tmp/app-release.apks universal.apk
+            mv universal.apk app-release.apk
+            echo "Built local universal APK as fallback (signed with upload key)"
+          fi
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: ${{steps.sign.outputs.signedReleaseFile}}
+          files: |
+            http/build/outputs/bundle/release/http-release.aab
+            app-release.apk
           prerelease: true
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload to Play Store
-        if: ${{ github.event.inputs.upload_play || startsWith(github.ref, 'refs/tags/') }}
-        uses: r0adkll/upload-google-play@v1
-        with:
-          serviceAccountJsonPlainText: ${{ secrets.SERVICE_ACCOUNT_JSON }}
-          packageName: net.lifeupapp.lifeup.http
-          releaseFiles: ${{steps.sign.outputs.signedReleaseFile}}
-          track: internal
-          status: draft

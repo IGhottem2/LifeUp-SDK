@@ -1,8 +1,13 @@
 package net.lifeupapp.lifeup.http
 
 import android.app.Activity
+import android.app.ForegroundServiceStartNotAllowedException
 import android.content.ActivityNotFoundException
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Intent
+import android.content.res.Configuration
+import android.graphics.Color
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -13,13 +18,22 @@ import android.util.Log
 import android.view.View
 import android.view.animation.Animation
 import android.view.animation.RotateAnimation
+import android.widget.CompoundButton
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.AppCompatImageButton
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.core.view.isGone
+import androidx.core.view.isVisible
+import androidx.core.view.updatePadding
 import androidx.lifecycle.lifecycleScope
+import android.widget.TextView
 import com.google.android.material.card.MaterialCardView
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import io.ktor.util.toLowerCasePreservingASCIIRules
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -31,12 +45,17 @@ import net.lifeupapp.lifeup.api.Val
 import net.lifeupapp.lifeup.api.Val.DOCUMENT_LINK
 import net.lifeupapp.lifeup.api.Val.DOCUMENT_LINK_CN
 import net.lifeupapp.lifeup.api.Val.DOCUMENT_LINK_CN_HANT
+import net.lifeupapp.lifeup.api.Val.DOCUMENT_LINK_MCP
+import net.lifeupapp.lifeup.api.Val.DOCUMENT_LINK_MCP_CN
+import net.lifeupapp.lifeup.api.Val.DOCUMENT_LINK_MCP_HANT
 import net.lifeupapp.lifeup.api.content.info.InfoApi
 import net.lifeupapp.lifeup.http.databinding.ActivityMainBinding
 import net.lifeupapp.lifeup.http.qrcode.BarcodeScanningActivity
 import net.lifeupapp.lifeup.http.service.ConnectStatusManager
+import net.lifeupapp.lifeup.http.service.BroadcastGate
 import net.lifeupapp.lifeup.http.service.KtorService
 import net.lifeupapp.lifeup.http.service.LifeUpService
+import net.lifeupapp.lifeup.http.utils.CloudControl
 import net.lifeupapp.lifeup.http.utils.getIpAddressListInLocalNetwork
 import net.lifeupapp.lifeup.http.utils.setHtmlText
 
@@ -49,6 +68,8 @@ class MainActivity : AppCompatActivity() {
     private val settings by lazy {
         net.lifeupapp.lifeup.http.utils.Settings.getInstance(this)
     }
+    private var latestRunningState = LifeUpService.RunningState.NOT_RUNNING
+    private var latestServiceError: Throwable? = null
 
     private val resultLauncher =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
@@ -63,39 +84,51 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // init view binding
         binding = ActivityMainBinding.inflate(layoutInflater)
-        val view = binding.root
-        setContentView(view)
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        setContentView(binding.root)
+        configureSystemBars()
+        bindEdgeToEdge()
 
-        // init the view logic
         initView()
+        if (savedInstanceState == null) {
+            handleCloudControlIntent(intent)
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleCloudControlIntent(intent)
     }
 
     override fun onResume() {
         super.onResume()
         updatePermissionStatus()
         updateLocalIpAddress()
+        refreshBroadcastStatus()
     }
 
     private fun initView() {
         lifecycleScope.launch {
             launch {
                 KtorService.isRunning.collect { running ->
-                    if (running == LifeUpService.RunningState.RUNNING || running == LifeUpService.RunningState.STARTING) {
-                        binding.tvStatusServer.text =
-                            "✅ ${getString(R.string.serverStartedMessage)}"
-                        binding.switchStartService.isChecked = true
-                        binding.tvStatusServerIp.visibility = View.VISIBLE
-                    } else {
-                        binding.tvStatusServer.text = "❌ ${getString(R.string.server_status)}"
-                        binding.switchStartService.isChecked = false
-                        binding.tvStatusServerIp.visibility = View.GONE
+                    latestRunningState = running
+                    if (running == LifeUpService.RunningState.RUNNING) {
+                        latestServiceError = null
                     }
+                    renderServiceState()
                 }
             }
 
-            // 监听端口变化
+            launch {
+                KtorService.errorMessage.collect { throwable ->
+                    latestServiceError = throwable
+                    renderServiceState()
+                }
+            }
+
+            // Keep the IP summary aligned with the active server port.
             launch {
                 KtorService.port.collect { port ->
                     if (port > 0) {
@@ -107,14 +140,14 @@ class MainActivity : AppCompatActivity() {
             binding.tvIntroduction.movementMethod = LinkMovementMethod.getInstance()
             binding.tvIntroduction.setHtmlText(getString(R.string.app_introduction))
 
-            // 添加保存按钮
+            // Save all advanced settings in one action.
             binding.btnSaveAdvanced.setOnClickListener {
                 validateAndSaveWakeLockDuration()
                 validateAndSavePortSetting()
                 validateAndSaveApiToken()
             }
 
-            // 初始化高级设置
+            // Initialize the advanced settings form.
             binding.wakeLockDurationInput.setText(settings.wakeLockDuration.toString())
             binding.wakeLockDurationInput.setOnFocusChangeListener { _, hasFocus ->
                 if (!hasFocus) {
@@ -122,7 +155,7 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            // 初始化 API Token
+            // Initialize the API token input.
             binding.apiTokenInput.setText(settings.apiToken)
             binding.apiTokenInput.setOnFocusChangeListener { _, hasFocus ->
                 if (!hasFocus) {
@@ -130,18 +163,37 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            // 初始化跨域开关状态
+            // Initialize the CORS toggle.
             binding.switchCors.isChecked = settings.enableCors
             binding.switchCors.setOnCheckedChangeListener { _, isChecked ->
                 settings.enableCors = isChecked
-                // 如果服务正在运行，重启服务以应用新设置
                 if (binding.switchStartService.isChecked) {
-                    KtorService.stop()
-                    KtorService.start()
+                    KtorService.restart()
                 }
             }
 
-            // 设置折叠面板
+            binding.switchEventWs.isChecked = settings.enableEventWs
+            binding.switchEventWs.setOnCheckedChangeListener { _, isChecked ->
+                settings.enableEventWs = isChecked
+                if (binding.switchStartService.isChecked) {
+                    KtorService.restart()
+                }
+            }
+
+            binding.btnEnableBroadcasts.setOnClickListener {
+                lifecycleScope.launch {
+                    val ok = withContext(Dispatchers.IO) { BroadcastGate.enable() }
+                    renderBroadcastStatus()
+                    if (!ok) {
+                        Toast.makeText(this@MainActivity, R.string.lifeup_broadcasts_enable_failed, Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+            binding.btnOpenLab.setOnClickListener {
+                LifeUpApi.startApiActivity(this@MainActivity, "lifeup://api/goto?page=lab")
+            }
+
+            // Configure the expandable sections.
             setupExpandablePanel(
                 binding.advancedHeader,
                 binding.btnToggleAdvanced,
@@ -153,12 +205,18 @@ class MainActivity : AppCompatActivity() {
                 binding.cardAbout
             )
 
-            // 设置文档点击事件
+            // Route both documentation entry points to the same action.
             binding.documentHeader.setOnClickListener {
-                openDocumentation()
+                openLocalizedUrl(DOCUMENT_LINK, DOCUMENT_LINK_CN, DOCUMENT_LINK_CN_HANT)
             }
             binding.btnDocument.setOnClickListener {
-                openDocumentation()
+                openLocalizedUrl(DOCUMENT_LINK, DOCUMENT_LINK_CN, DOCUMENT_LINK_CN_HANT)
+            }
+            binding.mcpHeader.setOnClickListener {
+                openLocalizedUrl(DOCUMENT_LINK_MCP, DOCUMENT_LINK_MCP_CN, DOCUMENT_LINK_MCP_HANT)
+            }
+            binding.btnMcp.setOnClickListener {
+                openLocalizedUrl(DOCUMENT_LINK_MCP, DOCUMENT_LINK_MCP_CN, DOCUMENT_LINK_MCP_HANT)
             }
 
             lifecycleScope.launchWhenResumed {
@@ -184,7 +242,7 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            // 初始化端口设置
+            // Initialize the port input.
             binding.portSettingInput.setText(
                 if (settings.customPort > 0)
                     settings.customPort.toString()
@@ -199,6 +257,11 @@ class MainActivity : AppCompatActivity() {
         }
 
         binding.switchStartService.setOnCheckedChangeListener { buttonView, isChecked ->
+            if (!buttonView.isUserTriggeredCheckChange()) {
+                return@setOnCheckedChangeListener
+            }
+            latestServiceError = null
+            renderServiceState()
             if (isChecked) {
                 KtorService.start()
             } else {
@@ -206,6 +269,11 @@ class MainActivity : AppCompatActivity() {
             }
             updateLocalIpAddress()
         }
+
+        binding.tvCloudSchemeStart.text = CloudControl.URL_START
+        binding.tvCloudSchemeStop.text = CloudControl.URL_STOP
+        binding.tvCloudSchemeStart.setOnClickListener { copyCloudScheme(CloudControl.URL_START) }
+        binding.tvCloudSchemeStop.setOnClickListener { copyCloudScheme(CloudControl.URL_STOP) }
 
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
             binding.includeBatteryConfig.btn.isGone = true
@@ -267,12 +335,85 @@ class MainActivity : AppCompatActivity() {
             binding.includeOverlayConfig.btn.isGone = true
         }
 
+        binding.btnQrcodeHelp.setOnClickListener {
+            showQrcodeHelpDialog()
+        }
+
         binding.btnQrcodeScan.setOnClickListener {
             resultLauncher.launch(Intent(this, BarcodeScanningActivity::class.java))
         }
 
         binding.tvAboutVersion.text = getString(R.string.cloud_version, BuildConfig.VERSION_NAME)
         binding.tvAboutDesc.setHtmlText(getString(R.string.about_text))
+    }
+
+    private fun bindEdgeToEdge() {
+        val contentTopPadding = binding.contentContainer.paddingTop
+        val contentBottomPadding = binding.contentContainer.paddingBottom
+        val contentLeftPadding = binding.contentContainer.paddingLeft
+        val contentRightPadding = binding.contentContainer.paddingRight
+        ViewCompat.setOnApplyWindowInsetsListener(binding.root) { _, insets ->
+            val systemBarsInsets = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            binding.contentContainer.updatePadding(
+                left = contentLeftPadding + systemBarsInsets.left,
+                top = contentTopPadding + systemBarsInsets.top,
+                right = contentRightPadding + systemBarsInsets.right,
+                bottom = contentBottomPadding + systemBarsInsets.bottom
+            )
+            insets
+        }
+        ViewCompat.requestApplyInsets(binding.root)
+    }
+
+    private fun configureSystemBars() {
+        window.statusBarColor = Color.TRANSPARENT
+        val isDarkTheme =
+            resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK ==
+                    Configuration.UI_MODE_NIGHT_YES
+        WindowInsetsControllerCompat(window, window.decorView).isAppearanceLightStatusBars =
+            !isDarkTheme
+    }
+
+    private fun renderServiceState() {
+        val isRunning = latestRunningState == LifeUpService.RunningState.RUNNING
+        val isStarting = latestRunningState == LifeUpService.RunningState.STARTING
+        val errorMessage = latestServiceError?.let(::getServiceErrorMessage)
+
+        val statusText = when {
+            isRunning -> "✅ ${getString(R.string.serverStartedMessage)}"
+            isStarting -> "⏳ ${getString(R.string.serverStartingMessage)}"
+            errorMessage != null -> getString(R.string.serverStartFailedMessage, errorMessage)
+            else -> "❌ ${getString(R.string.server_status)}"
+        }
+
+        binding.tvStatusServer.text = statusText
+        binding.tvStatusServerIp.isVisible = isRunning
+        binding.switchStartService.isEnabled = !isStarting
+        if (binding.switchStartService.isChecked != (isRunning || isStarting)) {
+            binding.switchStartService.isChecked = isRunning || isStarting
+        }
+    }
+
+    private fun getServiceErrorMessage(error: Throwable): String {
+        val localizedMessage = error.localizedMessage
+        return when {
+            error is java.net.BindException && settings.customPort > 0 -> {
+                getString(R.string.port_setting_conflict, settings.customPort)
+            }
+
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                    error is ForegroundServiceStartNotAllowedException -> {
+                getString(R.string.server_error_background_restricted)
+            }
+
+            localizedMessage.isNullOrBlank() -> {
+                getString(R.string.server_error_unknown)
+            }
+
+            else -> {
+                localizedMessage
+            }
+        }
     }
 
     private fun updateLocalIpAddress() {
@@ -289,7 +430,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updatePermissionStatus() {
-        // 检查悬浮窗权限
+        // Check the overlay permission state.
         val hasOverlayPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             android.provider.Settings.canDrawOverlays(this)
         } else {
@@ -301,7 +442,7 @@ class MainActivity : AppCompatActivity() {
             "❌ ${getString(R.string.status_permission_overlay_missing)}"
         }
 
-        // 检查电池优化权限
+        // Check whether battery optimizations are disabled for this app.
         val hasBatteryPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             powerManager.isIgnoringBatteryOptimizations(packageName)
         } else {
@@ -329,28 +470,19 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun openDocumentation() {
+    private fun openLocalizedUrl(en: String, cn: String, hant: String) {
         val locale = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             resources.configuration.locales.get(0)
         } else {
+            @Suppress("DEPRECATION")
             resources.configuration.locale
         }
-        val intent = Intent(Intent.ACTION_VIEW)
         val url = when {
-            locale.language == "zh" && locale.country.toLowerCasePreservingASCIIRules() == "cn" -> {
-                DOCUMENT_LINK_CN
-            }
-
-            locale.language == "zh" -> {
-                DOCUMENT_LINK_CN_HANT
-            }
-
-            else -> {
-                DOCUMENT_LINK
-            }
+            locale.language == "zh" && locale.country.toLowerCasePreservingASCIIRules() == "cn" -> cn
+            locale.language == "zh" -> hant
+            else -> en
         }
-        intent.data = Uri.parse(url)
-        startActivity(intent)
+        startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
     }
 
     private fun setupExpandablePanel(
@@ -402,10 +534,9 @@ class MainActivity : AppCompatActivity() {
         if (port != null && port in net.lifeupapp.lifeup.http.utils.Settings.MIN_PORT..net.lifeupapp.lifeup.http.utils.Settings.MAX_PORT) {
             settings.customPort = port
             binding.portSettingLayout.error = null
-            // 如果服务正在运行，需要重启服务以应用新端口
+            // Restart the service so the new port is applied immediately.
             if (binding.switchStartService.isChecked) {
-                KtorService.stop()
-                KtorService.start()
+                KtorService.restart()
             }
         } else {
             binding.portSettingLayout.error = getString(R.string.port_setting_error)
@@ -423,10 +554,76 @@ class MainActivity : AppCompatActivity() {
         settings.apiToken = input
         binding.apiTokenLayout.error = null
 
-        // 如果服务正在运行，需要重启服务以应用新设置
+        // Restart the service so the new token is applied immediately.
         if (binding.switchStartService.isChecked) {
-            KtorService.stop()
-            KtorService.start()
+            KtorService.restart()
+        }
+    }
+
+    private fun CompoundButton.isUserTriggeredCheckChange(): Boolean {
+        return isPressed
+    }
+
+    private fun showQrcodeHelpDialog() {
+        val dialog = MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.qrcode_help_title)
+            .setMessage(R.string.qrcode_help_message)
+            .setPositiveButton(R.string.qrcode_help_ok, null)
+            .show()
+        dialog.findViewById<TextView>(com.google.android.material.R.id.message)?.apply {
+            setLineSpacing(0f, 1.3f)
+        }
+    }
+
+    private fun refreshBroadcastStatus() {
+        lifecycleScope.launch {
+            withContext(Dispatchers.IO) { BroadcastGate.refresh(force = true) }
+            renderBroadcastStatus()
+        }
+    }
+
+    private fun renderBroadcastStatus() {
+        if (!::binding.isInitialized) return
+        when (BroadcastGate.status) {
+            BroadcastGate.Status.On -> {
+                binding.tvLifeupBroadcasts.setText(R.string.lifeup_broadcasts_on)
+                binding.btnEnableBroadcasts.isGone = true
+                binding.btnOpenLab.isGone = true
+            }
+            BroadcastGate.Status.Off -> {
+                binding.tvLifeupBroadcasts.setText(R.string.lifeup_broadcasts_off)
+                binding.btnEnableBroadcasts.isVisible = true
+                binding.btnOpenLab.isGone = true
+            }
+            BroadcastGate.Status.Unsupported -> {
+                binding.tvLifeupBroadcasts.setText(R.string.lifeup_broadcasts_unknown)
+                binding.btnEnableBroadcasts.isGone = true
+                binding.btnOpenLab.isVisible = true
+            }
+            BroadcastGate.Status.Unknown -> {
+                binding.tvLifeupBroadcasts.setText(R.string.lifeup_broadcasts_unknown)
+                binding.btnEnableBroadcasts.isGone = true
+                binding.btnOpenLab.isVisible = true
+            }
+        }
+    }
+
+    private fun handleCloudControlIntent(intent: Intent?) {
+        when (CloudControl.parse(intent?.data?.scheme, intent?.data?.host)) {
+            CloudControl.Action.START -> {
+                latestServiceError = null
+                KtorService.start()
+            }
+            CloudControl.Action.STOP -> KtorService.stop()
+            null -> Unit
+        }
+    }
+
+    private fun copyCloudScheme(url: String) {
+        val clipboard = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+        clipboard.setPrimaryClip(ClipData.newPlainText("lifeupcloud", url))
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            Toast.makeText(this, getString(R.string.cloud_scheme_copied, url), Toast.LENGTH_SHORT).show()
         }
     }
 

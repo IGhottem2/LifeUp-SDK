@@ -8,8 +8,6 @@ import android.os.Bundle
 import android.os.SystemClock
 import android.util.Log
 import io.ktor.http.ContentType
-import io.ktor.http.HttpHeaders
-import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.content.PartData
 import io.ktor.http.content.forEachPart
@@ -34,7 +32,15 @@ import io.ktor.server.routing.post
 import io.ktor.server.routing.route
 import io.ktor.server.routing.routing
 import io.ktor.server.websocket.WebSockets
+import io.ktor.server.websocket.webSocket
+import io.ktor.websocket.CloseReason
+import io.ktor.websocket.Frame
+import io.ktor.websocket.close
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.isActive
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -62,11 +68,18 @@ import net.lifeupapp.lifeup.api.content.data.DataApi
 import net.lifeupapp.lifeup.api.content.feelings.FeelingsApi
 import net.lifeupapp.lifeup.api.content.info.InfoApi
 import net.lifeupapp.lifeup.api.content.pomodoro.PomodoroApi
+import net.lifeupapp.lifeup.api.content.records.CoinRecordsApi
+import net.lifeupapp.lifeup.api.content.records.ExpRecordsApi
+import net.lifeupapp.lifeup.api.content.records.InventoryRecordsApi
+import net.lifeupapp.lifeup.api.content.records.LevelDefinesApi
+import net.lifeupapp.lifeup.api.content.records.StatisticsApi
+import net.lifeupapp.lifeup.api.content.records.StepRecordsApi
 import net.lifeupapp.lifeup.api.content.shop.ItemsApi
 import net.lifeupapp.lifeup.api.content.skills.SkillsApi
 import net.lifeupapp.lifeup.api.content.syntheis.SynthesisApi
 import net.lifeupapp.lifeup.api.content.tasks.TasksApi
 import net.lifeupapp.lifeup.http.base.AppScope
+import net.lifeupapp.lifeup.http.BuildConfig
 import net.lifeupapp.lifeup.http.base.appCtx
 import net.lifeupapp.lifeup.http.utils.Settings
 import net.lifeupapp.lifeup.http.utils.WakeLockManager
@@ -82,6 +95,22 @@ import java.util.logging.Level
 import java.util.logging.Logger
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.DurationUnit
+
+internal fun resolveStartPort(customPort: Int, retryPortOverride: Int?): Int {
+    return retryPortOverride ?: if (customPort > 0) customPort else Settings.DEFAULT_PORT
+}
+
+internal fun nextAutoRetryPort(currentPort: Int): Int {
+    return if (currentPort + 1 > Settings.MAX_PORT) {
+        Settings.MIN_PORT
+    } else {
+        currentPort + 1
+    }
+}
+
+internal fun buildServerBaseUrl(host: String, port: Int): String {
+    return "http://$host:$port"
+}
 
 object KtorService : LifeUpService {
 
@@ -107,28 +136,6 @@ object KtorService : LifeUpService {
     override val errorMessage: StateFlow<Throwable?>
         get() = _errorMessage
 
-    init {
-        scope.launch {
-            _isRunning.collect {
-                logger.info("KtorService is running: $it")
-                when (it) {
-                    LifeUpService.RunningState.RUNNING -> {
-                        ServerNotificationService.start(appCtx)
-                        val duration = Settings.getInstance(appCtx).wakeLockDuration
-                        wakeLockManager.stayAwake(duration.minutes.toLong(DurationUnit.MILLISECONDS))
-                        mDnsService.registerNsdService(port.value)
-                    }
-                    LifeUpService.RunningState.NOT_RUNNING -> {
-                        ServerNotificationService.cancel(appCtx)
-                        wakeLockManager.release()
-                        mDnsService.unregisterNsdService()
-                    }
-                    else -> {}
-                }
-            }
-        }
-    }
-
     private val RequestMoreWakeLockPlugin =
         createApplicationPlugin(name = "RequestMoreWakeLockPlugin") {
             onCall { _ ->
@@ -142,34 +149,48 @@ object KtorService : LifeUpService {
         }
 
     override fun start() {
+        scope.launch(Dispatchers.IO) { startInternal() }
+    }
+
+    fun restart() {
         scope.launch(Dispatchers.IO) {
+            stopInternal()
+            startInternal()
+        }
+    }
+
+    private suspend fun startInternal(portOverride: Int? = null) {
+            var retryWithNextPort: Int? = null
             mutex.withLock {
                 if (_isRunning.value != LifeUpService.RunningState.NOT_RUNNING || isStarting) {
                     logger.info("Server is already running or starting")
-                    return@launch
+                    return
                 }
                 isStarting = true
                 _errorMessage.value = null
                 _isRunning.value = LifeUpService.RunningState.STARTING
             }
+            val customPort = Settings.getInstance(appCtx).customPort
+            val startPort = resolveStartPort(customPort = customPort, retryPortOverride = portOverride)
 
             try {
-                // 确保之前的服务完全停止
+                ServerNotificationService.start(appCtx)
+
+                // Fully stop any previous server instance before recreating it.
                 server?.stop(1000, 2000)
                 server = null
 
-                // 等待一小段时间确保端口释放
+                // Give the OS a moment to release the previous port binding.
                 delay(500)
 
-                // 设置端口
-                val customPort = Settings.getInstance(appCtx).customPort
-                _port.value = if (customPort > 0) customPort else Settings.DEFAULT_PORT
+                // Prefer the retry override so automatic retries do not fall back to the default port.
+                _port.value = startPort
 
-                // 创建并启动新服务
+                // Create and start the new server instance.
                 server = createServer()
                 server?.start(wait = false)
 
-                // 等待服务器启动
+                // Poll briefly until the server starts responding.
                 var retryCount = 0
                 while (!isServerResponding() && retryCount < 5) {
                     delay(500)
@@ -177,6 +198,11 @@ object KtorService : LifeUpService {
                 }
 
                 if (isServerResponding()) {
+                    _errorMessage.value = null
+                    val duration = Settings.getInstance(appCtx).wakeLockDuration
+                    wakeLockManager.stayAwake(duration.minutes.toLong(DurationUnit.MILLISECONDS))
+                    EventHub.start(appCtx)
+                    mDnsService.registerNsdService(port.value)
                     _isRunning.value = LifeUpService.RunningState.RUNNING
                 } else {
                     throw Exception("Server failed to start after multiple retries")
@@ -187,67 +213,71 @@ object KtorService : LifeUpService {
                 _isRunning.value = LifeUpService.RunningState.NOT_RUNNING
                 server?.stop(1000, 2000)
                 server = null
+                ServerNotificationService.cancel(appCtx)
+                wakeLockManager.release()
+                EventHub.stop(appCtx)
+                mDnsService.unregisterNsdService()
 
-                // 如果是端口被占用，且没有使用自定义端口，尝试使用下一个端口
-                if (e is java.net.BindException && Settings.getInstance(appCtx).customPort == 0) {
-                    _port.value = port.value + 1
-                    if (port.value > Settings.MAX_PORT) {
-                        _port.value = Settings.MIN_PORT
-                    }
-                    start() // 递归尝试下一个端口
+                // Retry on the next port only when automatic port selection is in use.
+                if (e is java.net.BindException && customPort == 0) {
+                    retryWithNextPort = nextAutoRetryPort(startPort)
                 }
             } finally {
                 isStarting = false
             }
-        }
+
+            retryWithNextPort?.let { nextPort ->
+                startInternal(nextPort)
+            }
     }
 
     override fun stop() {
-        scope.launch(Dispatchers.IO) {
-            mutex.withLock {
-                if (_isRunning.value == LifeUpService.RunningState.NOT_RUNNING || isStopping) {
-                    logger.info("Server is already stopped or stopping")
-                    return@launch
-                }
-                isStopping = true
-            }
+        scope.launch(Dispatchers.IO) { stopInternal() }
+    }
 
-            try {
-                _isRunning.value = LifeUpService.RunningState.NOT_RUNNING
-                server?.stop(1000, 2000)
-                server = null
-
-                // 等待一小段时间确保资源释放
-                delay(500)
-            } catch (e: Exception) {
-                logger.log(Level.SEVERE, "Error stopping server", e)
-                _errorMessage.value = e
-            } finally {
-                isStopping = false
+    private suspend fun stopInternal() {
+        mutex.withLock {
+            if (_isRunning.value == LifeUpService.RunningState.NOT_RUNNING || isStopping) {
+                logger.info("Server is already stopped or stopping")
+                return
             }
+            isStopping = true
+        }
+
+        try {
+            EventHub.stop(appCtx)
+            server?.stop(1000, 2000)
+            server = null
+            ServerNotificationService.cancel(appCtx)
+            wakeLockManager.release()
+            mDnsService.unregisterNsdService()
+            _errorMessage.value = null
+            _isRunning.value = LifeUpService.RunningState.NOT_RUNNING
+
+            // Give the runtime a moment to release networking resources.
+            delay(500)
+        } catch (e: Exception) {
+            logger.log(Level.SEVERE, "Error stopping server", e)
+            _errorMessage.value = e
+        } finally {
+            isStopping = false
         }
     }
+
 
     private fun createServer() = embeddedServer(Netty, port.value, watchPaths = emptyList()) {
         install(WebSockets)
         install(CallLogging)
         install(ContentNegotiation) {
-            json()
+            json(CloudJson)
         }
+        installResourceConditionalGet()
         install(RequestMoreWakeLockPlugin)
 
         if (Settings.getInstance(appCtx).enableCors) {
             Log.i("KtorService", "enableCors is true")
             install(CORS) {
-                allowMethod(HttpMethod.Options)
-                allowMethod(HttpMethod.Get)
-                allowMethod(HttpMethod.Post)
-                allowMethod(HttpMethod.Put)
-                allowMethod(HttpMethod.Delete)
-                allowHeader(HttpHeaders.ContentType)
-                allowHeader(HttpHeaders.Authorization)
-                allowHeader(HttpHeaders.AccessControlAllowOrigin)
-                anyHost()
+                configureCloudCors()
             }
         } else {
             Log.i("KtorService", "enableCors is false")
@@ -263,28 +293,13 @@ object KtorService : LifeUpService {
             }
         }
 
-        // 添加 API Token 验证
-        val apiToken = Settings.getInstance(appCtx).apiToken
-        if (apiToken.isNotBlank()) {
-            install(createApplicationPlugin("ApiTokenValidation") {
-                onCall { call ->
-                    val authHeader = call.request.headers[HttpHeaders.Authorization]
-                    if (authHeader != apiToken) {
-                        call.respond(
-                            HttpStatusCode.Unauthorized,
-                            HttpResponse.error<String>(
-                                "Invalid API token",
-                                HttpStatusCode.Unauthorized.value
-                            )
-                        )
-                    }
-                }
-            })
-        }
+        // Enforce the optional API token before dispatching request handlers.
+        installApiTokenValidation(Settings.getInstance(appCtx).apiToken)
 
         routing {
             get("/") {
                 val localAddressIp = getIpAddressInLocalNetwork() ?: "UNKNOWN"
+                val serverBaseUrl = buildServerBaseUrl(localAddressIp, port.value)
                 call.respondText(ContentType.Text.Html) {
                     buildString {
                         appendHTML().html {
@@ -301,17 +316,17 @@ object KtorService : LifeUpService {
                                     +"GET request"
                                 }
                                 p {
-                                    +"http://$localAddressIp:$port/api?url=YOUR_ENCODED_API_URL"
+                                    +"$serverBaseUrl/api?url=YOUR_ENCODED_API_URL"
                                 }
                                 p {
                                     +"you can send the get request to call in directly, but you need to encode the API like this: "
                                 }
                                 p {
                                     a(
-                                        href = "http://$localAddressIp:$port/api?url=lifeup%3A%2F%2Fapi%2Freward%3Ftype%3Dcoin%26content%3DCall%20LifeUp%20API%20from%20HTTP%26number%3D1",
+                                        href = "$serverBaseUrl/api?url=lifeup%3A%2F%2Fapi%2Freward%3Ftype%3Dcoin%26content%3DCall%20LifeUp%20API%20from%20HTTP%26number%3D1",
                                         target = "_blank"
                                     ) {
-                                        +"http://$localAddressIp:$port/api?url=lifeup%3A%2F%2Fapi%2Freward%3Ftype%3Dcoin%26content%3DCall%20LifeUp%20API%20from%20HTTP%26number%3D1"
+                                        +"$serverBaseUrl/api?url=lifeup%3A%2F%2Fapi%2Freward%3Ftype%3Dcoin%26content%3DCall%20LifeUp%20API%20from%20HTTP%26number%3D1"
                                     }
                                 }
                                 div()
@@ -319,7 +334,7 @@ object KtorService : LifeUpService {
                                     +"POST request"
                                 }
                                 p {
-                                    +"http://${localAddressIp}$port/api"
+                                    +"$serverBaseUrl/api"
                                 }
                                 p {
                                     +"or you can POST it the below URL with 'application/json' content type and the body is a json string like this: "
@@ -433,7 +448,7 @@ object KtorService : LifeUpService {
                             val tempFile = File(appCtx.externalCacheDir, fileName)
                             tempFile.writeBytes(fileBytes)
 
-                            // 使用 FileProvider 创建内容 URI
+                            // Use FileProvider so external apps can read the exported file safely.
                             val contentUri = tempFile.getUriForFile()
                             uploadedFiles.add(contentUri)
                         }
@@ -454,7 +469,7 @@ object KtorService : LifeUpService {
                 // get all tasks
                 get {
                     LifeUpApi.getContentProviderApi<TasksApi>().listTasks(null).onSuccess {
-                        call.respond(it.wrapAsResponse())
+                        call.respondResource(it.wrapAsResponse())
                     }.onFailure {
                         call.respond(HttpResponse.error<String>(it))
                     }
@@ -464,7 +479,7 @@ object KtorService : LifeUpService {
                     get {
                         LifeUpApi.getContentProviderApi<TasksApi>()
                             .listTasks(call.parameters["id"]?.toLongOrNull()).onSuccess {
-                                call.respond(it.wrapAsResponse())
+                                call.respondResource(it.wrapAsResponse())
                             }.onFailure {
                                 call.respond(HttpResponse.error<String>(it))
                             }
@@ -480,7 +495,7 @@ object KtorService : LifeUpService {
                     LifeUpApi.getContentProviderApi<TasksApi>()
                         .listHistory(offset, limit, filterGid)
                         .onSuccess {
-                            call.respond(it.wrapAsResponse())
+                            call.respondResource(it.wrapAsResponse())
                         }.onFailure {
                             call.respond(HttpResponse.error<String>(it))
                         }
@@ -496,7 +511,7 @@ object KtorService : LifeUpService {
                     } else {
                         LifeUpApi.getContentProviderApi<ItemsApi>().listItems(null)
                     }.onSuccess {
-                        call.respond(it.wrapAsResponse())
+                        call.respondResource(it.wrapAsResponse())
                     }.onFailure {
                         call.respond(HttpResponse.error<String>(it))
                     }
@@ -506,7 +521,7 @@ object KtorService : LifeUpService {
                         val listId = call.parameters["listId"]?.toLongOrNull()
 
                         LifeUpApi.getContentProviderApi<ItemsApi>().listItems(listId).onSuccess {
-                            call.respond(it.wrapAsResponse())
+                            call.respondResource(it.wrapAsResponse())
                         }.onFailure {
                             call.respond(HttpResponse.error<String>(it))
                         }
@@ -517,7 +532,7 @@ object KtorService : LifeUpService {
             route("/tasks_categories") {
                 get {
                     LifeUpApi.getContentProviderApi<TasksApi>().listCategories().onSuccess {
-                        call.respond(it.wrapAsResponse())
+                        call.respondResource(it.wrapAsResponse())
                     }.onFailure {
                         call.respond(HttpResponse.error<String>(it))
                     }
@@ -528,7 +543,7 @@ object KtorService : LifeUpService {
                 get {
                     LifeUpApi.getContentProviderApi<AchievementApi>().listCategories()
                         .onSuccess {
-                            call.respond(it.wrapAsResponse())
+                            call.respondResource(it.wrapAsResponse())
                         }.onFailure {
                             call.respond(HttpResponse.error<String>(it))
                         }
@@ -537,8 +552,10 @@ object KtorService : LifeUpService {
 
             route("/items_categories") {
                 get {
-                    LifeUpApi.getContentProviderApi<ItemsApi>().listCategories().onSuccess {
-                        call.respond(it.wrapAsResponse())
+                    val includeHidden =
+                        call.request.queryParameters["include_hidden"]?.toBooleanStrictOrNull() ?: false
+                    LifeUpApi.getContentProviderApi<ItemsApi>().listCategories(includeHidden).onSuccess {
+                        call.respondResource(it.wrapAsResponse())
                     }.onFailure {
                         call.respond(HttpResponse.error<String>(it))
                     }
@@ -546,8 +563,13 @@ object KtorService : LifeUpService {
             }
 
             get("/info") {
-                LifeUpApi.getContentProviderApi<InfoApi>().getInfo().onSuccess {
-                    call.respond(it.wrapAsResponse())
+                LifeUpApi.getContentProviderApi<InfoApi>().getInfo().onSuccess { info ->
+                    call.respondResource(
+                        info.copy(
+                            cloudVersion = BuildConfig.VERSION_CODE,
+                            cloudVersionName = BuildConfig.VERSION_NAME,
+                        ).wrapAsResponse(),
+                    )
                 }.onFailure {
                     call.respond(HttpResponse.error<String>(it))
                 }
@@ -556,7 +578,7 @@ object KtorService : LifeUpService {
             route("/skills") {
                 get {
                     LifeUpApi.getContentProviderApi<SkillsApi>().listSkills().onSuccess {
-                        call.respond(it.wrapAsResponse())
+                        call.respondResource(it.wrapAsResponse())
                     }.onFailure {
                         call.respond(HttpResponse.error<String>(it))
                     }
@@ -567,7 +589,7 @@ object KtorService : LifeUpService {
                 get {
                     LifeUpApi.getContentProviderApi<AchievementApi>().listAchievements()
                         .onSuccess {
-                            call.respond(it.wrapAsResponse())
+                            call.respondResource(it.wrapAsResponse())
                         }.onFailure {
                             call.respond(HttpResponse.error<String>(it))
                         }
@@ -576,7 +598,7 @@ object KtorService : LifeUpService {
                     get {
                         LifeUpApi.getContentProviderApi<AchievementApi>()
                             .listAchievements(call.parameters["id"]?.toLongOrNull()).onSuccess {
-                                call.respond(it.wrapAsResponse())
+                                call.respondResource(it.wrapAsResponse())
                             }.onFailure {
                                 call.respond(HttpResponse.error<String>(it))
                             }
@@ -591,7 +613,7 @@ object KtorService : LifeUpService {
 
                     LifeUpApi.getContentProviderApi<FeelingsApi>().listFeelings(offset, limit)
                         .onSuccess {
-                            call.respond(it.wrapAsResponse())
+                            call.respondResource(it.wrapAsResponse())
                         }.onFailure {
                             logger.log(Level.WARNING, "Failed to get feelings", it)
                             call.respond(HttpResponse.error<String>(it))
@@ -603,7 +625,7 @@ object KtorService : LifeUpService {
                 get {
                     LifeUpApi.getContentProviderApi<SynthesisApi>().listSynthesis(null)
                         .onSuccess {
-                            call.respond(it.wrapAsResponse())
+                            call.respondResource(it.wrapAsResponse())
                         }.onFailure {
                             Log.e("LifeUp-Http", "Failed to get synthesis", it)
                             call.respond(HttpResponse.error<String>(it))
@@ -614,7 +636,7 @@ object KtorService : LifeUpService {
                         val id = call.parameters["id"]?.toLongOrNull()
                         LifeUpApi.getContentProviderApi<SynthesisApi>().listSynthesis(id)
                             .onSuccess {
-                                call.respond(it.wrapAsResponse())
+                                call.respondResource(it.wrapAsResponse())
                             }.onFailure {
                                 call.respond(HttpResponse.error<String>(it))
                             }
@@ -624,9 +646,11 @@ object KtorService : LifeUpService {
 
             route("/synthesis_categories") {
                 get {
-                    LifeUpApi.getContentProviderApi<SynthesisApi>().listCategories()
+                    val includeHidden =
+                        call.request.queryParameters["include_hidden"]?.toBooleanStrictOrNull() ?: false
+                    LifeUpApi.getContentProviderApi<SynthesisApi>().listCategories(includeHidden = includeHidden)
                         .onSuccess {
-                            call.respond(it.wrapAsResponse())
+                            call.respondResource(it.wrapAsResponse())
                         }.onFailure {
                             call.respond(HttpResponse.error<String>(it))
                         }
@@ -634,12 +658,40 @@ object KtorService : LifeUpService {
                 route("/{id}") {
                     get {
                         val id = call.parameters["id"]?.toLongOrNull()
-                        LifeUpApi.getContentProviderApi<SynthesisApi>().listCategories(id)
+                        val includeHidden =
+                            call.request.queryParameters["include_hidden"]?.toBooleanStrictOrNull() ?: false
+                        LifeUpApi.getContentProviderApi<SynthesisApi>().listCategories(id, includeHidden)
                             .onSuccess {
-                                call.respond(it.wrapAsResponse())
+                                call.respondResource(it.wrapAsResponse())
                             }.onFailure {
                                 call.respond(HttpResponse.error<String>(it))
                             }
+                    }
+                }
+            }
+
+            route("/skill_groups") {
+                get {
+                    val includeHidden =
+                        call.request.queryParameters["include_hidden"]?.toBooleanStrictOrNull() ?: false
+                    LifeUpApi.getContentProviderApi<SkillsApi>().listSkillGroups(includeHidden).onSuccess {
+                        call.respondResource(it.wrapAsResponse())
+                    }.onFailure {
+                        call.respond(HttpResponse.error<String>(it))
+                    }
+                }
+            }
+
+            route("/achievement_conditions") {
+                route("/{id}") {
+                    get {
+                        val id = call.parameters["id"]?.toLongOrNull()
+                            ?: return@get call.respond(HttpResponse.error<String>(IllegalArgumentException("id")))
+                        LifeUpApi.getContentProviderApi<AchievementApi>().listConditions(id).onSuccess {
+                            call.respondResource(it.wrapAsResponse())
+                        }.onFailure {
+                            call.respond(HttpResponse.error<String>(it))
+                        }
                     }
                 }
             }
@@ -656,9 +708,95 @@ object KtorService : LifeUpService {
                     LifeUpApi.getContentProviderApi<PomodoroApi>()
                         .listRecords(offset, limit, timeRangeStart, timeRangeEnd)
                         .onSuccess {
-                            call.respond(it.wrapAsResponse())
+                            call.respondResource(it.wrapAsResponse())
                         }.onFailure {
                             logger.log(Level.WARNING, "Failed to get pomodoro records", it)
+                            call.respond(HttpResponse.error<String>(it))
+                        }
+                }
+            }
+
+            route("/coin_records") {
+                get {
+                    val offset = call.request.queryParameters["offset"]?.toIntOrNull() ?: 0
+                    val limit = call.request.queryParameters["limit"]?.toIntOrNull() ?: 100
+                    val timeRangeStart = call.request.queryParameters["time_range_start"]?.toLongOrNull()
+                    val timeRangeEnd = call.request.queryParameters["time_range_end"]?.toLongOrNull()
+                    LifeUpApi.getContentProviderApi<CoinRecordsApi>()
+                        .listRecords(offset, limit, timeRangeStart, timeRangeEnd)
+                        .onSuccess { call.respondResource(it.wrapAsResponse()) }
+                        .onFailure {
+                            logger.log(Level.WARNING, "Failed to get coin records", it)
+                            call.respond(HttpResponse.error<String>(it))
+                        }
+                }
+            }
+            route("/inventory_records") {
+                get {
+                    val offset = call.request.queryParameters["offset"]?.toIntOrNull() ?: 0
+                    val limit = call.request.queryParameters["limit"]?.toIntOrNull() ?: 100
+                    val timeRangeStart = call.request.queryParameters["time_range_start"]?.toLongOrNull()
+                    val timeRangeEnd = call.request.queryParameters["time_range_end"]?.toLongOrNull()
+                    LifeUpApi.getContentProviderApi<InventoryRecordsApi>()
+                        .listRecords(offset, limit, timeRangeStart, timeRangeEnd)
+                        .onSuccess { call.respondResource(it.wrapAsResponse()) }
+                        .onFailure {
+                            logger.log(Level.WARNING, "Failed to get inventory records", it)
+                            call.respond(HttpResponse.error<String>(it))
+                        }
+                }
+            }
+            route("/exp_records") {
+                get {
+                    val offset = call.request.queryParameters["offset"]?.toIntOrNull() ?: 0
+                    val limit = call.request.queryParameters["limit"]?.toIntOrNull() ?: 100
+                    val timeRangeStart = call.request.queryParameters["time_range_start"]?.toLongOrNull()
+                    val timeRangeEnd = call.request.queryParameters["time_range_end"]?.toLongOrNull()
+                    LifeUpApi.getContentProviderApi<ExpRecordsApi>()
+                        .listRecords(offset, limit, timeRangeStart, timeRangeEnd)
+                        .onSuccess { call.respondResource(it.wrapAsResponse()) }
+                        .onFailure {
+                            logger.log(Level.WARNING, "Failed to get exp records", it)
+                            call.respond(HttpResponse.error<String>(it))
+                        }
+                }
+            }
+
+            route("/step_records") {
+                get {
+                    val offset = call.request.queryParameters["offset"]?.toIntOrNull() ?: 0
+                    val limit = call.request.queryParameters["limit"]?.toIntOrNull() ?: 100
+                    val timeRangeStart = call.request.queryParameters["time_range_start"]?.toLongOrNull()
+                    val timeRangeEnd = call.request.queryParameters["time_range_end"]?.toLongOrNull()
+                    LifeUpApi.getContentProviderApi<StepRecordsApi>()
+                        .listRecords(offset, limit, timeRangeStart, timeRangeEnd)
+                        .onSuccess { call.respondResource(it.wrapAsResponse()) }
+                        .onFailure {
+                            logger.log(Level.WARNING, "Failed to get step records", it)
+                            call.respond(HttpResponse.error<String>(it))
+                        }
+                }
+            }
+            route("/level_defines") {
+                get {
+                    LifeUpApi.getContentProviderApi<LevelDefinesApi>()
+                        .getDefines()
+                        .onSuccess { call.respondResource(it.wrapAsResponse()) }
+                        .onFailure {
+                            logger.log(Level.WARNING, "Failed to get level defines", it)
+                            call.respond(HttpResponse.error<String>(it))
+                        }
+                }
+            }
+            route("/statistics") {
+                get {
+                    val timeRangeStart = call.request.queryParameters["time_range_start"]?.toLongOrNull()
+                    val timeRangeEnd = call.request.queryParameters["time_range_end"]?.toLongOrNull()
+                    LifeUpApi.getContentProviderApi<StatisticsApi>()
+                        .getStatistics(timeRangeStart, timeRangeEnd)
+                        .onSuccess { call.respondResource(it.wrapAsResponse()) }
+                        .onFailure {
+                            logger.log(Level.WARNING, "Failed to get statistics", it)
                             call.respond(HttpResponse.error<String>(it))
                         }
                 }
@@ -724,7 +862,7 @@ object KtorService : LifeUpService {
                             setDataAndType(contentUri, "application/octet-stream")
                             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                            setPackage(Val.LIFEUP_PACKAGE_NAME) // 设置目标应用的包名
+                            setPackage(Val.LIFEUP_PACKAGE_NAME) // Target the LifeUp app explicitly.
                         }
                         appCtx.startActivity(intent)
                         call.respond(HttpResponse.success("File uploaded and BackupActivity launched"))
@@ -732,6 +870,55 @@ object KtorService : LifeUpService {
                         call.respond(HttpResponse.error<String>("No file received"))
                     }
 
+                }
+            }
+
+            get("/events") {
+                val after = call.request.queryParameters["after"]?.toLongOrNull() ?: 0L
+                val limit = (call.request.queryParameters["limit"]?.toIntOrNull() ?: 50).coerceIn(1, EventBuffer.CAPACITY)
+                call.respond(
+                    HttpResponse.success(
+                        EventsPage(
+                            latestId = EventHub.latestId,
+                            eventWs = Settings.getInstance(appCtx).enableEventWs,
+                            events = EventHub.since(after, limit),
+                            broadcasts = BroadcastGate.refresh(),
+                        )
+                    )
+                )
+            }
+
+            if (Settings.getInstance(appCtx).enableEventWs) {
+                webSocket("/events") {
+                    val duration = Settings.getInstance(appCtx).wakeLockDuration
+                    wakeLockManager.stayAwake(duration.minutes.toLong(DurationUnit.MILLISECONDS))
+                    val after = call.request.queryParameters["after"]?.toLongOrNull() ?: 0L
+                    val channel = Channel<CloudEvent>(Channel.UNLIMITED)
+                    val replayed = mutableSetOf<Long>()
+                    val listener: (CloudEvent) -> Unit = { event ->
+                        if (replayed.add(event.id)) channel.trySend(event)
+                    }
+                    EventHub.addListener(listener)
+                    try {
+                        EventHub.since(after).forEach { event ->
+                            if (replayed.add(event.id)) {
+                                send(Frame.Text(Json.encodeToString(event)))
+                            }
+                        }
+                        launch {
+                            while (isActive) {
+                                delay(30_000)
+                                send(Frame.Ping(ByteArray(0)))
+                                wakeLockManager.stayAwake(duration.minutes.toLong(DurationUnit.MILLISECONDS))
+                            }
+                        }
+                        for (event in channel) {
+                            send(Frame.Text(Json.encodeToString(event)))
+                        }
+                    } finally {
+                        EventHub.removeListener(listener)
+                        channel.close()
+                    }
                 }
             }
 
@@ -743,7 +930,7 @@ object KtorService : LifeUpService {
                                 emptyMap()
                             )
                     }.onSuccess {
-                        call.respond(it.wrapAsResponse())
+                        call.respondResource(it.wrapAsResponse())
                     }.onFailure {
                         call.respond(HttpResponse.error<String>(it))
                     }

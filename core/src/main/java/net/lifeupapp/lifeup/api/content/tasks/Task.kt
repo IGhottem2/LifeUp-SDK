@@ -19,13 +19,19 @@ data class Task(
     val coin: Long,
     val coinVariable: Long,
     val itemId: Long,
+    val itemAmount: Int,
     val words: String,
     val categoryId: Long,
     val order: Int,
     val nameExtended: String,
     val endTime: Long,
     val items: List<RewardItem>,
-    val subTasks: List<SubTask>
+    val subTasks: List<SubTask>,
+    val countProgress: TaskCountProgress? = null,
+    val repeatEndCondition: TaskRepeatEndCondition? = null,
+    val weekdays: String = "",
+    val importance: Int? = null,
+    val difficulty: Int? = null
 ) {
     class Builder {
         private var id: Long? = null
@@ -37,6 +43,7 @@ data class Task(
         private var deadline: Long? = null
         private var remindTime: Long? = null
         private var frequency: Int = 0
+        private var weekdays: String = ""
         private var exp: Int = 0
         private var skillIds: List<Long> = emptyList()
         private var coin: Long = 0
@@ -50,6 +57,10 @@ data class Task(
         private var endTime: Long = 0
         private var items: List<RewardItem> = emptyList()
         private var subTasks: List<SubTask> = emptyList()
+        private var countProgress: TaskCountProgress? = null
+        private var repeatEndCondition: TaskRepeatEndCondition? = null
+        private var importance: Int? = null
+        private var difficulty: Int? = null
 
         fun setId(id: Long?) = apply { this.id = id }
 
@@ -66,6 +77,8 @@ data class Task(
         fun setRemindTime(remindTime: Long?) = apply { this.remindTime = remindTime }
 
         fun setFrequency(frequency: Int) = apply { this.frequency = frequency }
+
+        fun setWeekdays(weekdays: String) = apply { this.weekdays = weekdays }
 
         fun setExp(exp: Int) = apply { this.exp = exp }
 
@@ -93,6 +106,18 @@ data class Task(
 
         fun setSubTasks(subTasks: List<SubTask>) = apply { this.subTasks = subTasks }
 
+        fun setCountProgress(countProgress: TaskCountProgress?) = apply {
+            this.countProgress = countProgress
+        }
+
+        fun setRepeatEndCondition(repeatEndCondition: TaskRepeatEndCondition?) = apply {
+            this.repeatEndCondition = repeatEndCondition
+        }
+
+        fun setImportance(importance: Int?) = apply { this.importance = importance }
+
+        fun setDifficulty(difficulty: Int?) = apply { this.difficulty = difficulty }
+
         fun build(): Task {
             return Task(
                 id = id,
@@ -109,13 +134,19 @@ data class Task(
                 coin = coin,
                 coinVariable = coinVariable,
                 itemId = itemId ?: 0,
+                itemAmount = itemAmount,
                 words = words,
                 categoryId = categoryId ?: 0,
                 order = order,
                 nameExtended = nameExtended,
                 endTime = endTime,
                 items = items,
-                subTasks = subTasks
+                subTasks = subTasks,
+                countProgress = countProgress,
+                repeatEndCondition = repeatEndCondition,
+                weekdays = weekdays,
+                importance = importance,
+                difficulty = difficulty
             )
         }
     }

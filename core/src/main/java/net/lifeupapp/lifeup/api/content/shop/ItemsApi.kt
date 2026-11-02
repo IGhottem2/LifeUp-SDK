@@ -5,29 +5,38 @@ import net.lifeupapp.lifeup.api.content.ContentProviderApi
 import net.lifeupapp.lifeup.api.content.ContentProviderUrl
 import net.lifeupapp.lifeup.api.content.forEachContent
 import net.lifeupapp.lifeup.api.content.shop.category.ShopCategory
+import net.lifeupapp.lifeup.api.utils.getBooleanOrNull
 import net.lifeupapp.lifeup.api.utils.getIntOrNull
 import net.lifeupapp.lifeup.api.utils.getLongOrNull
 import net.lifeupapp.lifeup.api.utils.getStringOrNull
 
 class ItemsApi(private val context: Context) : ContentProviderApi {
 
-    fun listCategories(): Result<List<ShopCategory>> {
+    fun listCategories(includeHidden: Boolean = false): Result<List<ShopCategory>> {
         val categories = mutableListOf<ShopCategory>()
         try {
-            context.forEachContent(ContentProviderUrl.SHOP_CATEGORIES) {
+            val uri = buildString {
+                append(ContentProviderUrl.SHOP_CATEGORIES)
+                if (includeHidden) append("?include_hidden=true")
+            }
+            context.forEachContent(uri) {
                 val id = it.getLongOrNull("_ID")
                 val name = it.getStringOrNull("name")
-                val isAsc = it.getIntOrNull("isAsc")
+                val isAsc = it.getBooleanOrNull("isAsc")
                 val sort = it.getStringOrNull("sort")
                 val order = it.getIntOrNull("order")
+                val hidden = (it.getIntOrNull("hidden") ?: 0) == 1
+                val inventoryHidden = (it.getIntOrNull("inventory_hidden") ?: 0) == 1
 
                 categories.add(
                     ShopCategory.builder {
                         setId(id)
                         setName(name ?: "ERROR: name is null")
-                        setIsAsc(isAsc == 1)
+                        setIsAsc(isAsc ?: false)
                         setSort(sort ?: "")
                         setOrder(order ?: 0)
+                        setHidden(hidden)
+                        setInventoryHidden(inventoryHidden)
                     }
                 )
             }
@@ -59,6 +68,12 @@ class ItemsApi(private val context: Context) : ContentProviderApi {
                 val order = it.getIntOrNull("order")
                 val disablePurchase = it.getIntOrNull("disablePurchase")
                 val maxPurchaseNumber = it.getIntOrNull("maxPurchaseNumber")
+                val titleColorString = it.getStringOrNull("titleColorString")
+                val actionText = it.getStringOrNull("actionText")
+                val unlist = it.getIntOrNull("unlist")
+                val disableUse = it.getIntOrNull("disableUse")
+                val purchaseLimit = it.getStringOrNull("purchaseLimit")
+                val limitScope = it.getStringOrNull("limitScope")
 
                 items.add(
                     ShopItem.builder {
@@ -73,6 +88,12 @@ class ItemsApi(private val context: Context) : ContentProviderApi {
                         setOrder(order ?: 0)
                         setDisablePurchase(disablePurchase == 1)
                         setMaxPurchaseNumber(maxPurchaseNumber)
+                        setTitleColorString(titleColorString)
+                        setActionText(actionText)
+                        setUnlist(unlist == 1)
+                        setDisableUse(disableUse == 1)
+                        setPurchaseLimit(purchaseLimit)
+                        setLimitScope(limitScope)
                     }
                 )
             }
@@ -104,6 +125,12 @@ class ItemsApi(private val context: Context) : ContentProviderApi {
                 val order = it.getIntOrNull("order")
                 val disablePurchase = it.getIntOrNull("disablePurchase")
                 val maxPurchaseNumber = it.getIntOrNull("maxPurchaseNumber")
+                val titleColorString = it.getStringOrNull("titleColorString")
+                val actionText = it.getStringOrNull("actionText")
+                val unlist = it.getIntOrNull("unlist")
+                val disableUse = it.getIntOrNull("disableUse")
+                val purchaseLimit = it.getStringOrNull("purchaseLimit")
+                val limitScope = it.getStringOrNull("limitScope")
 
                 items.add(
                     ShopItem.builder {
@@ -118,6 +145,12 @@ class ItemsApi(private val context: Context) : ContentProviderApi {
                         setOrder(order ?: 0)
                         setDisablePurchase(disablePurchase == 1)
                         setMaxPurchaseNumber(maxPurchaseNumber)
+                        setTitleColorString(titleColorString)
+                        setActionText(actionText)
+                        setUnlist(unlist == 1)
+                        setDisableUse(disableUse == 1)
+                        setPurchaseLimit(purchaseLimit)
+                        setLimitScope(limitScope)
                     }
                 )
             }
